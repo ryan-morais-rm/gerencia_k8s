@@ -1,0 +1,9 @@
+[package]
+name = "nayr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+nix = { version = "0.31.3", features = ["sched", "mount", "user", "process"] }
+rusqlite = "0.31" 

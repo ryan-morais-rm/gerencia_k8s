@@ -1,0 +1,28 @@
+# --- Artefatos de Compilação do Rust ---
+# Ignora a pasta target onde ficam os binários gerados pelo Cargo
+nayr/target/
+
+# --- Dados Dinâmicos do Container Runtime ---
+# Ignora as imagens base baixadas via git clone/pull
+images/
+
+# Ignora os pontos de montagem finais dos containers
+containers/*
+# Abre uma exceção para não apagar a pasta vazia se quiser mantê-la no Git
+!containers/.gitkeep
+
+# Ignora as camadas de escrita modificadas (OverlayFS)
+overlays/*
+!overlays/.gitkeep
+
+# Ignora os arquivos de logs gerados pelos containers
+logs/*.log
+
+# --- Banco de Dados Local ---
+# Ignora o banco de dados do SQLite e arquivos de trava temporários
+container.db
+container.db-journal
+container.db-wal
+
+# --- Arquivos do Sistema Operacional / IDE ---
+.vscode/
