@@ -4,7 +4,7 @@ nayr/target/
 
 # --- Dados Dinâmicos do Container Runtime ---
 # Ignora as imagens base baixadas via git clone/pull
-images/
+images/base
 
 # Ignora os pontos de montagem finais dos containers
 containers/*

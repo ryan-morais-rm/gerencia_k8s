@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
-nix = { version = "0.31.3", features = ["sched", "mount", "user", "process"] }
-rusqlite = "0.31" 
+nix = { version = "0.31.3", features = ["sched", "mount", "user", "process", "hostname", "fs"] }
+rusqlite = "0.31"
