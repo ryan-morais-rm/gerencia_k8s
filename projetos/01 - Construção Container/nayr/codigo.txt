@@ -4,73 +4,64 @@ DOCUMENTAÇÃO DO CÓDIGO FONTE - MOTOR DE CONTAINER (NAYR)
 
 1. VISÃO GERAL DAS BIBLIOTECAS (IMPORTS)
 -----------------------------------------------------------------------
-- `clap::{Parser, Subcommand}`: É a biblioteca responsável por criar a interface de linha de comando (CLI). 
-   Ela lê o que o usuário digita no terminal (ex: "nayr run --name teste") e transforma isso em variáveis seguras no Rust.
-- `nix::mount::{mount, MsFlags}`: Faz a ponte entre o Rust e o Kernel do Linux para executar a chamada de sistema (syscall) `mount`. 
-   Usado para montar o OverlayFS e configurar diretórios privados.
-- `nix::sched::{unshare, CloneFlags}`: A peça central dos containers. A função `unshare` serve para "desvincular" o processo atual da máquina real, 
-   criando os Namespaces (isolamento).
-- `std::fs` e `std::path::Path`: Bibliotecas padrão do Rust para manipular caminhos de pastas e criar diretórios no disco.
-- `std::process::Command`: Usado para executar comandos externos (subprocessos) a partir do Rust. Usamos para rodar o "git", 
-   para o binário chamar a si mesmo (re-exec) e para rodar o "/bin/sh" final.
+- `std::fs` e `std::path::Path`: Bibliotecas nativas do Rust para manipular caminhos, arquivos e deletar/criar pastas no disco.
+- `std::process::Command`: Executa comandos externos (subprocessos). Usado para rodar o "git", executar o próprio binário de novo 
+   (re-exec) e rodar os comandos finais dentro do container.
+- `clap::{Parser, Subcommand}`: Cria a interface de linha de comando (CLI) profissional, traduzindo o que o usuário digita em estruturas Rust.
+- `nix::mount::{mount, MsFlags}`: Faz a ponte direta com o Kernel do Linux para a syscall `mount`.
+- `nix::sched::{unshare, CloneFlags}`: A mágica dos containers. Isola recursos do sistema operacional criando Namespaces (PID, Mount, Hostname, etc).
+- `rusqlite::{Connection, Result}`: Biblioteca de banco de dados para conectar, ler e gravar no SQLite nativo.
 
-2. ESTRUTURA DA LINHA DE COMANDO (STRUCT CLI E ENUM COMMANDS)
+2. ESTRUTURA DA CLI (Struct Cli e Enum Commands)
 -----------------------------------------------------------------------
-O programa define três comandos principais usando o `clap`:
-- `Pull`: Recebe uma URL de repositório (`--repo`) para baixar a imagem base.
-- `Run`: Recebe o nome do container (`--name`) e o processo que vai rodar (`--exec`, com valor padrão de `/bin/sh`).
-- `Child`: É um comando OCULTO (`hide = true`). O usuário não deve digitar isso. Ele é usado internamente pelo próprio 
-  programa para continuar a execução depois que o ambiente é isolado.
+Define os comandos que o usuário pode digitar:
+- `Pull`: Baixa a imagem base de um repositório git.
+- `Run`: Inicia o container com um nome e um comando (padrão: `/bin/sh`).
+- `Ps`: Lista os containers registrados no banco de dados.
+- `Rm`: Remove os arquivos temporários e o registro do banco de dados de um container.
+- `Child` (Oculto): O usuário nunca digita isso. O programa usa esse comando internamente para continuar rodando *depois* de 
+   ter entrado na "Matrix" (Namespaces isolados).
 
-3. A FUNÇÃO PRINCIPAL: `main()`
+3. O FLUXO PRINCIPAL: `main()`
 -----------------------------------------------------------------------
-A execução começa aqui e segue estas etapas lógicas:
+A validação inicial verifica se o usuário é `root` (UID 0), pois o Kernel Linux exige permissões máximas para usar namespaces e 
+montagens especiais. Após isso, o programa lê qual comando foi digitado:
 
-A. Validação de Root: 
-   O programa verifica se está rodando como `root` (UID 0). Sem isso, o Kernel proíbe criar Namespaces e fazer montagens.
+A. COMANDO PULL (`nayr pull`)
+   Chama a função auxiliar para clonar ou atualizar (via git) o sistema de arquivos base na pasta `images/base`.
 
-B. O Comando 'Pull':
-   Se o usuário digitou `pull`, chama a função `baixar_ou_atualizar_imagem` definindo o destino como "images/base".
+B. COMANDO RUN (`nayr run`) - "O Processo Pai"
+   1. Cria Pastas: Chama `preparar_pastas_overlay` apenas para criar as pastas vazias no host. Ele NÃO faz a montagem aqui para não "sujar" a máquina real.
+   2. Isolamento (Unshare): Cria uma barreira no Kernel separando processos (NEWPID), montagens (NEWNS) e hostname (NEWUTS).
+   3. O Re-exec: O binário chama a si mesmo (`/proc/self/exe`) passando o comando oculto `child`. Esse novo processo "filho" nasce 
+      inteiramente dentro do ambiente isolado.
+   4. Banco de Dados (Início): Pega o PID (ID do processo) do filho e insere no banco SQLite com o status "Running".
+   5. Espera: O Pai fica bloqueado esperando o Filho (o container) terminar. Quando acaba, atualiza o SQLite para "Exited".
 
-C. O Comando 'Run' (O Processo Pai):
-   Se o usuário digitou `run`, o "Processo Pai" faz 3 coisas:
-   1. Chama o OverlayFS: Cria as pastas upper/work e junta com a imagem base.
-   2. Isola o Ambiente: Executa `unshare` isolando PID (processos), UTS (rede/hostname) e Mount (pontos de montagem).
-   3. O Truque do Re-exec: O Processo Pai cria um "Processo Filho" chamando seu próprio binário (`/proc/self/exe`) 
-      mas passando o comando oculto `child`. Em seguida, o Pai fica "esperando" (`wait`) esse Filho terminar.
+C. COMANDO CHILD (`nayr child`) - "A Matrix"
+   Roda dentro do ambiente isolado e prepara o terreno final:
+   1. Montagem Privada: Aplica a flag `MS_PRIVATE` na raiz. Isso impede que as montagens que faremos a seguir vazem para o Vivobook real.
+   2. Mount do OverlayFS: Agora sim, chama `montar_overlay_interno` para juntar as pastas em camadas de forma segura. Quando o container 
+      morrer, esse mount morre com ele.
+   3. Hostname e Proc: Altera o hostname e monta o sistema `/proc` falso, para que comandos como `ps` executados *dentro* do container só vejam
+      os processos isolados.
+   4. A Prisão (Chroot): Tranca a visão do sistema para a pasta do container.
+   5. Execução Segura: Pega a string do comando digitada pelo usuário (ex: "ls -la") e quebra em pedaços lógicos com `split_whitespace`. 
+      Separa o programa ("ls") dos argumentos ("-la"). Executa o programa e entrega o controle ao usuário.
 
-D. O Comando 'Child' (O Processo Filho Isolado):
-   Quando o programa roda como `child`, ele JÁ ESTÁ DENTRO do ambiente isolado (Namespaces). Aqui ocorre a "mágica" final do container:
-   1. Proteção de Montagem: Roda um `mount` com a flag `MS_PRIVATE` na raiz (`/`). Isso impede que as montagens 
-      que o container fizer afetem a máquina real.
-   2. Hostname: Altera o nome da máquina (dentro do container) para o nome passado pelo usuário.
-   3. Montagem do /proc: Monta o sistema de processos virtual (`/proc`) para que comandos como `ps` 
-      funcionem dentro do container enxergando apenas os processos isolados.
-   4. A Prisão (Chroot): Executa `chroot` mudando o diretório raiz (`/`) para a pasta `containers/nome_do_container`.
-   5. O Executável Final: Roda o comando pedido pelo usuário (ex: `/bin/sh`). Neste momento, o terminal do usuário é anexado ao container.
+D. COMANDO PS (`nayr ps`)
+   Conecta no banco `container.db`, executa um `SELECT` puxando o nome, PID, status e comando. Itera sobre os resultados e imprime uma tabela 
+   visualmente formatada na tela.
 
-4. FUNÇÕES AUXILIARES
+E. COMANDO RM (`nayr rm`)
+   1. Apaga os Arquivos: Encontra as pastas `overlays/nome` e `containers/nome` criadas durante a execução e usa `fs::remove_dir_all` para varrê-las do disco.
+   2. Limpa o DB: Faz um comando `DELETE` no SQLite buscando o nome do container para remover o seu registro.
+
+4. FUNÇÕES AUXILIARES DETALHADAS
 -----------------------------------------------------------------------
-A. `baixar_ou_atualizar_imagem(repo_url, caminho_destino)`
-   - Verifica se a pasta "images/base" já existe.
-   - Se já tiver um ".git" lá dentro, significa que a imagem já foi baixada. O Rust então dispara no terminal um comando 
-     `git pull` para atualizá-la.
-   - Se não existir, o Rust dispara um `git clone <URL>` para baixar o sistema de arquivos base inteiro.
-
-B. `configurar_e_montar_overlay(name)`
-   - É responsável por preparar o "disco rígido" do container.
-   - Verifica se a imagem base realmente existe antes de continuar.
-   - Cria 3 pastas dinâmicas específicas para o container atual:
-     * `overlays/{nome}/upper`: Onde as alterações (escrita) serão salvas.
-     * `overlays/{nome}/work`: Pasta de controle exigida pelo Kernel do Linux.
-     * `containers/{nome}`: O diretório final (Merged).
-   - Monta a string de opções exigida pelo Kernel ("lowerdir=...,upperdir=...,workdir=...").
-   - Dispara a chamada de sistema nativa `mount` do tipo "overlay", unindo as pastas de leitura e escrita e projetando o 
-     resultado na pasta `containers/{nome}`.
-   - Retorna o caminho da pasta montada para que a função principal saiba onde aplicar o `chroot`.
-
-=======================================================================
-RESUMO DO FLUXO (O CICLO DE VIDA)
-=======================================================================
-Usuário digita: nayr run -> nayr monta o OverlayFS -> nayr cria os Namespaces -> nayr clona a si mesmo (child) -> nayr child configura 
-diretórios privados -> nayr child aplica o chroot -> nayr child executa o /bin/sh -> Usuário ganha o shell isolado.
+- `baixar_ou_atualizar_imagem`: Orquestra processos filhos do sistema executando `git clone` ou `git pull` para baixar o rootfs (Alpine, Debian, etc).
+- `preparar_pastas_overlay`: Apenas cria a infraestrutura de pastas físicas (`upper`, `work`, e a pasta de mesclagem) exigidas pelo OverlayFS sem montar nada.
+- `montar_overlay_interno`: Monta uma string de opções de montagem (`lowerdir=X,upperdir=Y,workdir=Z`) e faz a syscall `mount` com a flag 
+   "overlay", sobrepondo os arquivos temporários em cima da base imutável.
+- `init_db`: Cria o arquivo físico do banco de dados na raiz do projeto e emite um `CREATE TABLE IF NOT EXISTS`, garantindo que a tabela de containers 
+  (nome, pid, status, comando) esteja sempre pronta para ser usada sem crashs.
