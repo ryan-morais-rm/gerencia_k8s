@@ -1,9 +1,10 @@
-use clap::{Parser, Subcommand};
-use nix::mount::{mount, MsFlags};
-use nix::sched::{unshare, CloneFlags};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use clap::{Parser, Subcommand};
+use nix::mount::{mount, MsFlags};
+use nix::sched::{unshare, CloneFlags};
+use rusqlite::{Connection, Result as SqlResult};
 
 #[derive(Parser)]
 #[command(name = "nayr")]
@@ -25,6 +26,7 @@ enum Commands {
         #[arg(short, long, default_value = "/bin/sh")]
         exec: String,
     },
+    Ps,
     #[command(hide = true)]
     Child {
         #[arg(short, long)]
@@ -32,7 +34,12 @@ enum Commands {
         #[arg(short, long)]
         exec: String,
     },
+    Rm {
+        #[arg(short, long)]
+        name: String,
+    },
 }
+
 fn main() {
     if !nix::unistd::Uid::current().is_root() {
         eprintln!("Erro: O 'nayr' precisa ser executado com privilégios de superusuário (sudo).");
@@ -48,9 +55,9 @@ fn main() {
             baixar_ou_atualizar_imagem(repo, destino);
         }
         Commands::Run { name, exec } => {
-            println!("Configurando o ambiente para o container '{}'...", name);
-            
-            let merged_dir = configurar_e_montar_overlay(name);
+            println!("Criando infraestrutura e Namespaces para '{}'...", name);
+
+            preparar_pastas_overlay(name);
 
             unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .expect("Falha ao criar novos namespaces (unshare)");
@@ -64,25 +71,35 @@ fn main() {
                 .spawn()
                 .expect("Falha ao reexecutar o binário em modo child");
 
+            let child_pid = child_proc.id();
+            if let Ok(conn) = init_db() {
+                conn.execute(
+                    "INSERT OR REPLACE INTO containers (name, pid, status, command) VALUES (?1, ?2, ?3, ?4)",
+                    (name, child_pid, "Running", exec),
+                ).ok();
+            }
             match child_proc.wait() {
-                Ok(status) => println!("\nContainer '{}' finalizado com status: {}", name, status),
-                Err(e) => eprintln!("Erro ao aguardar o container: {}", e),
+                Ok(status) => {
+                    println!("\nContentor '{}' finalizado com status: {}", name, status);
+                    if let Ok(conn) = init_db() {
+                        conn.execute("UPDATE containers SET status = 'Exited' WHERE name = ?1", [name]).ok();
+                    }
+                }
+                Err(e) => eprintln!("Erro ao aguardar o contentor: {}", e),
             }
         }
         Commands::Child { name, exec } => {
-            println!("Container isolado via Namespaces. Configurando montagens privadas...");
-
             nix::mount::mount(
                 None::<&str>,
                 "/",
                 None::<&str>,
                 nix::mount::MsFlags::MS_PRIVATE | nix::mount::MsFlags::MS_REC,
                 None::<&str>,
-            ).expect("Falha ao definir propagação de montagem como privada");
+            ).expect("Falha ao privar a montagem");
 
-            let merged_path = format!("containers/{}", name);
+            let merged_path = montar_overlay_interno(name);
 
-            nix::unistd::sethostname(name).expect("Falha ao definir hostname do container");
+            nix::unistd::sethostname(name).expect("Falha ao definir hostname");
 
             let proc_path = format!("{}/proc", merged_path);
             if Path::new(&proc_path).exists() {
@@ -94,18 +111,80 @@ fn main() {
                     None::<&str>,
                 ).ok(); 
             }
-            // --------------------------------------------------
 
             nix::unistd::chroot(merged_path.as_str()).expect("Falha ao aplicar chroot");
             std::env::set_current_dir("/").expect("Falha ao mudar para a raiz do container");
 
-            println!("Executando processo interno: {}\n", exec);
+            let mut partes_comando = exec.split_whitespace();
+            let programa = partes_comando.next().unwrap_or("/bin/sh");
+            let argumentos: Vec<&str> = partes_comando.collect();
+
+            println!("Executando processo interno: {} {:?}", programa, argumentos);
             
-            let mut final_cmd = Command::new(exec)
+            let mut final_cmd = Command::new(programa)
+                .args(&argumentos)
                 .spawn()
                 .expect("Erro: Não foi possível executar o binário dentro do jail.");
 
             final_cmd.wait().expect("Falha ao aguardar o processo interno terminar");
+        }
+        Commands::Ps => {
+            if let Ok(conn) = init_db() {
+                let mut stmt = conn.prepare("SELECT name, pid, status, command FROM containers").unwrap();
+                let container_iter = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                }).unwrap();
+
+                println!("{:<15} {:<10} {:<15} {}", "NOME", "PID", "STATUS", "COMANDO");
+                println!("{:-<60}", ""); 
+                
+                for c in container_iter {
+                    let (name, pid, status, cmd) = c.unwrap();
+                    println!("{:<15} {:<10} {:<15} {}", name, pid, status, cmd);
+                }
+            } else {
+                eprintln!("Erro ao aceder ao banco de dados dos contentores.");
+            }
+        }
+        Commands::Rm { name } => {
+            println!("A iniciar a limpeza do contentor '{}'...", name);
+            
+            let upper_dir = format!("overlays/{}/upper", name);
+            let work_dir = format!("overlays/{}/work", name);
+            let overlay_parent = format!("overlays/{}", name);
+            let merged_dir = format!("containers/{}", name);
+
+            if Path::new(&overlay_parent).exists() {
+                if let Err(e) = fs::remove_dir_all(&overlay_parent) {
+                    eprintln!("Aviso: Falha ao remover pastas do overlay: {}", e);
+                } else {
+                    println!("- Camadas de escrita (upper/work) removidas.");
+                }
+            }
+
+            if Path::new(&merged_dir).exists() {
+                if let Err(e) = fs::remove_dir_all(&merged_dir) {
+                    eprintln!("Aviso: Falha ao remover a pasta raiz do contentor: {}", e);
+                } else {
+                    println!("- Pasta de montagem removida.");
+                }
+            }
+
+            if let Ok(conn) = init_db() {
+                let linhas_apagadas = conn.execute("DELETE FROM containers WHERE name = ?1", [name]).unwrap_or(0);
+                if linhas_apagadas > 0 {
+                    println!("- Registo do banco de dados removido.");
+                } else {
+                    println!("- O contentor não constava no banco de dados.");
+                }
+            }
+            
+            println!("Contentor removido com sucesso!");
         }
     }
 }
@@ -119,58 +198,43 @@ fn baixar_ou_atualizar_imagem(repo_url: &str, caminho_destino: &str) {
 
     if Path::new(caminho_destino).join(".git").exists() {
         println!("Imagem detectada em '{}'. Atualizando via 'git pull'...", caminho_destino);
-        
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(caminho_destino)
-            .arg("pull")
-            .status()
-            .expect("Falha ao executar o comando git pull");
-
-        if status.success() {
-            println!("Imagem base atualizada com sucesso!");
-        } else {
-            println!("Erro ao tentar atualizar o repositório.");
-        }
+        let status = Command::new("git").arg("-C").arg(caminho_destino).arg("pull").status().unwrap();
+        if status.success() { println!("Imagem base atualizada com sucesso!"); }
     } else {
         println!("🛰️ Clonando rootfs a partir de: {}", repo_url);
-        
-        let status = Command::new("git")
-            .arg("clone")
-            .arg(repo_url)
-            .arg(caminho_destino)
-            .status()
-            .expect("Falha ao executar o comando git clone");
-
-        if status.success() {
-            println!("Imagem base baixada com sucesso em '{}'!", caminho_destino);
-        } else {
-            println!("Erro ao tentar clonar o repositório. Verifique a URL.");
-        }
+        let status = Command::new("git").arg("clone").arg(repo_url).arg(caminho_destino).status().unwrap();
+        if status.success() { println!("Imagem base baixada com sucesso!"); }
     }
 }
 
-fn configurar_e_montar_overlay(name: &str) -> String {
+fn preparar_pastas_overlay(name: &str) {
     let lower_dir = "images/base";
     let upper_dir = format!("overlays/{}/upper", name);
     let work_dir = format!("overlays/{}/work", name);
     let merged_dir = format!("containers/{}", name);
 
     if !Path::new(lower_dir).exists() {
-        eprintln!("Erro: Imagem base não encontrada em '{}'. Rode 'nayr pull' primeiro.", lower_dir);
+        eprintln!("Erro: Imagem base não encontrada. Rode 'nayr pull' primeiro.");
         std::process::exit(1);
     }
 
     fs::create_dir_all(&upper_dir).unwrap();
     fs::create_dir_all(&work_dir).unwrap();
     fs::create_dir_all(&merged_dir).unwrap();
+}
+
+fn montar_overlay_interno(name: &str) -> String {
+    let lower_dir = "images/base";
+    let upper_dir = format!("overlays/{}/upper", name);
+    let work_dir = format!("overlays/{}/work", name);
+    let merged_dir = format!("containers/{}", name);
 
     let options = format!(
         "lowerdir={},upperdir={},workdir={}",
         lower_dir, upper_dir, work_dir
     );
 
-    println!("Montando sistema de arquivos em camadas (OverlayFS)...");
+    println!("Montando sistema de arquivos (OverlayFS) dentro do namespace...");
     
     mount(
         Some("overlay"),
@@ -178,8 +242,23 @@ fn configurar_e_montar_overlay(name: &str) -> String {
         Some("overlay"),
         MsFlags::empty(),
         Some(options.as_str()),
-    )
-    .expect("Falha ao montar o OverlayFS. Certifique-se de estar usando caminhos compatíveis.");
+    ).expect("Falha ao montar o OverlayFS isolado.");
 
     merged_dir
+}
+
+fn init_db() -> SqlResult<Connection> {
+    let conn = Connection::open("container.db")?;
+    
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS containers (
+            name TEXT PRIMARY KEY,
+            pid INTEGER,
+            status TEXT,
+            command TEXT
+        )",
+        (),
+    )?;
+    
+    Ok(conn)
 }
