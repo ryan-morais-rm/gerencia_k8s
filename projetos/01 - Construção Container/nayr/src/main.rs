@@ -25,6 +25,8 @@ enum Commands {
         name: String,
         #[arg(short, long, default_value = "/bin/sh")]
         exec: String,
+        #[arg(short, long)]
+        memory: Option<u32>,
     },
     Ps,
     #[command(hide = true)]
@@ -54,7 +56,7 @@ fn main() {
             println!("Iniciando gerenciamento da imagem base...");
             baixar_ou_atualizar_imagem(repo, destino);
         }
-        Commands::Run { name, exec } => {
+        Commands::Run { name, exec, memory } => {
             println!("Criando infraestrutura e Namespaces para '{}'...", name);
 
             preparar_pastas_overlay(name);
@@ -72,6 +74,9 @@ fn main() {
                 .expect("Falha ao reexecutar o binário em modo child");
 
             let child_pid = child_proc.id();
+            
+            configurar_cgroup(name, child_pid, *memory);
+
             if let Ok(conn) = init_db() {
                 conn.execute(
                     "INSERT OR REPLACE INTO containers (name, pid, status, command) VALUES (?1, ?2, ?3, ?4)",
@@ -175,6 +180,15 @@ fn main() {
                 }
             }
 
+            let cgroup_dir = format!("/sys/fs/cgroup/nayr_{}", name);
+            if Path::new(&cgroup_dir).exists() {
+                if let Err(e) = fs::remove_dir(&cgroup_dir) {
+                    eprintln!("Aviso: Falha ao remover cgroup: {}", e);
+                } else {
+                    println!("- Limites de recursos (Cgroups) removidos.");
+                }
+            }
+
             if let Ok(conn) = init_db() {
                 let linhas_apagadas = conn.execute("DELETE FROM containers WHERE name = ?1", [name]).unwrap_or(0);
                 if linhas_apagadas > 0 {
@@ -261,4 +275,25 @@ fn init_db() -> SqlResult<Connection> {
     )?;
     
     Ok(conn)
+}
+
+fn configurar_cgroup(name: &str, pid: u32, memory_mb: Option<u32>) {
+    let cgroup_path = format!("/sys/fs/cgroup/nayr_{}", name);
+
+    if !Path::new(&cgroup_path).exists() {
+        fs::create_dir_all(&cgroup_path).expect("Falha ao criar diretório do cgroup");
+    }
+
+    if let Some(mem) = memory_mb {
+        let mem_bytes = mem * 1024 * 1024; 
+        let mem_path = format!("{}/memory.max", cgroup_path);
+        
+        fs::write(&mem_path, mem_bytes.to_string())
+            .unwrap_or_else(|_| eprintln!("Aviso: Falha ao definir limite de memória. O sistema possui Cgroups v2 ativo?"));
+            
+        println!("Limite de RAM restrito para {} MB.", mem);
+    }
+
+    let procs_path = format!("{}/cgroup.procs", cgroup_path);
+    fs::write(&procs_path, pid.to_string()).expect("Falha ao registrar processo no cgroup");
 }
