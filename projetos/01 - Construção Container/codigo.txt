@@ -1,0 +1,107 @@
+=======================================================================
+DOCUMENTAÇÃO DO CÓDIGO FONTE - MOTOR DE CONTAINER (NAYR)
+=======================================================================
+
+1. VISÃO GERAL DAS BIBLIOTECAS (IMPORTS)
+-----------------------------------------------------------------------
+- `std::fs` e `std::path::Path`: Bibliotecas nativas do Rust utilizadas para manipulação do sistema de arquivos do Host (anfitrião). 
+Elas permitem criar, validar a existência e apagar recursivamente os diretórios dos containers e estruturas do cgroup.
+- `std::process::Command`: API nativa essencial para spawnar e gerenciar subprocessos. Utilizada para invocar comandos externos (como o Git),
+ disparar o mecanismo de Re-executando do próprio binário (`/proc/self/exe`) e lançar o binário final trancado no jail.
+- `clap::{Parser, Subcommand}`: Framework robusto para parsing de argumentos via linha de comando (CLI). Transforma os comandos e flags digitados
+pelo usuário em enums e structs fortemente tipados no Rust.
+- `nix::mount::{mount, MsFlags}`: Bindings seguros POSIX/Linux que fazem a interface direta com as chamadas de sistema (syscalls) nativas 
+de montagem de partições e manipulação da árvore de diretórios do Kernel.
+- `nix::sched::{unshare, CloneFlags}`: O coração conceitual da virtualização a nível de OS. A syscall `unshare` altera os contextos de 
+execução e constrói as barreiras lógicas isolando o container em novos Namespaces do Kernel Linux.
+- `rusqlite::{Connection, Result}`: Driver do banco de dados relacional leve (SQLite). Utilizado para criar persistência local de 
+metadados, facilitando a rastreabilidade das instâncias sem depender de servidores externos.
+
+2. ESTRUTURA DA CLI (Struct Cli e Enum Commands)
+-----------------------------------------------------------------------
+Mapeia de forma explícita as instruções expostas na interface de console:
+- `Pull`: Responsável por clonar ou sincronizar o RootFS imutável (camada base) através de um repositório git informado na flag `--repo`.
+- `Run`: Inicializa um container exigindo uma flag obrigatória de identidade (`--name`), um binário para execução (`--exec`) e 
+uma flag opcional para restrição de memória RAM (`--memory`) medida em Megabytes.
+- `Ps`: Executa uma busca na camada de dados local e formata uma listagem histórica/em tempo real de todos os containers catalogados.
+- `Rm`: Expõe a ferramenta de desalocação e limpeza (`--name`), responsável por destruir as persistências de disco e registros associados
+àquela instância específica.
+- `Child` (Oculto via metaprogramação): Comando administrativo interno inacessível ao console comum do usuário. É acionado de forma 
+programática para assumir a execução do binário logo após a ruptura de namespaces promovida pelo processo pai.
+
+3. O FLUXO PRINCIPAL: `main()`
+-----------------------------------------------------------------------
+Toda execução do motor inicia-se validando se a identidade executora possui privilégios de superusuário (`root`), verificando se o UID é 
+estritamente zero através da crate `nix`. Sem essa validação, o Kernel abortaria imediatamente a criação de namespaces e pontos de montagem 
+especiais devido a políticas restritas de segurança. Satisfeito o pré-requisito, a CLI processa os blocos de lógica:
+
+A. COMANDO PULL (`nayr pull`)
+   Invoca a sub-função `baixar_ou_atualizar_imagem` alimentada pela URL informada, injetando no sistema o diretório `images/base` mapeado 
+   como o esqueleto raiz do container.
+
+B. COMANDO RUN (`nayr run`) - "O Processo Pai / Orquestrador"
+   Este bloco atua exclusivamente no nível do Host para manter o sistema limpo de dependências órfãs:
+   1. Garantia Estrutural: Roda a função `preparar_pastas_overlay`, montando as pastas cruciais do OverlayFS no disco. Ele não realiza 
+   acoplamentos de montagem neste momento para blindar a máquina real.
+   2. Ruptura de Namespaces: A chamada `unshare` altera a tabela de mapeamento do Kernel criando novos Namespaces:
+      - `CLONE_NEWPID`: Desenha uma tabela de processos limpa. O container não consegue ver os processos reais rodando na máquina 
+      (oculta o ambiente do usuário).
+      - `CLONE_NEWNS`: Clona a tabela de montagem de arquivos. Mudanças em partições dentro do container não alteram as partições do anfitrião.
+      - `CLONE_NEWUTS`: Modifica as tabelas lógicas de rede e hostname, permitindo que o container se batize com um nome exclusivo sem 
+      corromper o nome da máquina física.
+   3. Mecanismo de Re-exec: O processo pai executa um fork direcionado ao endereço virtual `/proc/self/exe` (o próprio binário em memória), 
+   acionando de forma mascarada o subcomando de apoio `child` com os devidos argumentos.
+   4. Ativação do Bônus Cgroups (RAM): Logo após capturar com sucesso o ID numérico (PID) do processo filho recém-nascido, o pai aciona a função 
+   `configurar_cgroup`. Essa chamada "captura" o PID do filho e o insere nas amarras do subsistema de memória do Kernel do Linux.
+   5. Registro e Bloqueio: Persiste a inicialização no SQLite registrando o estado como "Running". O processo pai se bloqueia no método `.wait()` 
+   monitorando o término do container. Ao receber a interrupção de encerramento do filho, atualiza o status na base para "Exited".
+
+C. COMANDO CHILD (`nayr child`) - "Dentro da Matrix"
+   Este escopo roda inteiramente isolado nos limites dos novos Namespaces e realiza a preparação interna do ambiente seguro:
+   1. Blindagem de Escrita (`MS_PRIVATE`): Executa um mount recursivo aplicando isolamento estrito à raiz. Garante de forma definitiva que 
+   qualquer ponto de montagem gerado dentro do container não suba de nível e cause vazamento de visibilidade para o sistema anfitrião.
+   2. Fusão de Camadas: Aciona a rotina `montar_overlay_interno`, acoplando dinamicamente o OverlayFS. A partir deste ponto, o container 
+   ganha uma visão unificada (pasta `merged`) composta pela base imutável unida à camada volátil de escrita do usuário.
+   3. Manipulação de Identidade e Processos: Seta o hostname do container com base no nome escolhido e força a montagem de um sistema de arquivos 
+   virtual `/proc` local e exclusivo. Sem esse `/proc` isolado, o comando `ps` dentro do container revelaria os dados confidenciais do host.
+   4. Prisão de Diretório (`chroot`): Redireciona o ponteiro lógico da raiz do sistema (`/`) para a pasta de fusão `merged`. Uma vez dentro 
+   da prisão, o comando `set_current_dir("/")` reposiciona o contexto de diretório interno no novo topo da pirâmide.
+   5. Tratamento de Injeção de Argumentos: Para contornar falhas arquiteturais de segurança e aceitar comandos parametrizados (ex: `ls -la /bin`), 
+   o código quebra a string longa baseando-se em espaços vazios através do método `.split_whitespace()`. O primeiro fragmento é mapeado estritamente 
+   como o binário operacional executável e o restante é empacotado de forma íntegra em um vetor de referências imutáveis.
+   6. Spawn Final: Executa o programa interno sob o papel definitivo de PID 1 (Processo Principal) do container, bloqueando-se até o encerramento 
+   do fluxo interativo.
+
+D. COMANDO PS (`nayr ps`)
+   Interage diretamente com a camada SQLite abrindo uma conexão segura no arquivo físico `container.db`. O programa prepara a query 
+   `SELECT name, pid, status, command FROM containers` e utiliza iteradores seguros do Rust para processar as linhas retornadas, imprimindo as 
+   informações em colunas formatadas de tamanho fixo no terminal.
+
+E. COMANDO RM (`nayr rm`)
+   Fornece a automação do ciclo de vida completo do container por meio de três limpezas simultâneas:
+   1. Destruição do OverlayFS: Localiza os caminhos físicos mapeados nas pastas de trabalho e dados da instância e utiliza o comando seguro 
+   `fs::remove_dir_all` para liberar o espaço ocupado no disco rígido do host.
+   2. Higienização de Recursos (Cgroups): Localiza o diretório virtual do subsistema em `/sys/fs/cgroup/nayr_NOME`. Como o processo associado 
+   já foi encerrado pelo Kernel, o diretório é liberado e removido via `fs::remove_dir`, devolvendo o controle de cotas de RAM e impedindo acúmulo 
+   de lixo no gerenciador de recursos.
+   3. Expurgamento de Metadados: Executa uma query parametrizada de deleção no SQLite (`DELETE FROM containers WHERE name = ?1`). Um contador de 
+   linhas afetadas é verificado para validar o sucesso da operação.
+
+4. DETALHAMENTO DE FUNÇÕES AUXILIARES E CGROUPS
+-----------------------------------------------------------------------
+- `configurar_cgroup(name, pid, memory_mb)`: Implementação avançada nativa do **Cgroups v2** do Linux moderno. Cria um nó de controle de recursos 
+mapeado como diretório físico dentro de `/sys/fs/cgroup/`. Se o limite em Megabytes for fornecido, ele realiza a conversão matemática matemática 
+de escala transformando-a em bytes inteiros (`MB * 1024 * 1024`) e escreve essa string de limite restritivo diretamente no arquivo do Kernel Linux 
+chamado `memory.max`. Por fim, injeta o PID do processo do container dentro do arquivo controlador `cgroup.procs`. Qualquer tentativa de alocação 
+de heap ou estouro de stack dentro do container que tente desafiar o teto definido fará com que o subsistema do Kernel dispare uma rotina de 
+interrupção instantânea (OOM Killer) para preservar o anfitrião.
+- `baixar_ou_atualizar_imagem`: Utiliza o comando `git` do host para automatizar o RootFS. Valida a existência do subdiretório confidencial `.git` 
+na pasta destino para decidir de forma autônoma se deve poupar rede e realizar apenas uma atualização de branch (`git pull`) ou um download completo 
+inicial (`git clone`).
+- `preparar_pastas_overlay`: Responsável por estruturar a anatomia do UnionFS criando o diretório estático `upper` (onde todas as modificações, 
+arquivos criados e exclusões geradas pelo container ficarão fisicamente gravados), o diretório técnico `work` (usado pelo Kernel Linux como área 
+de troca para transações atômicas de escrita) e o diretório de destino unificado `containers/nome`.
+- `montar_overlay_interno`: Formata a string de parâmetros de especificação do driver de arquivo (`lowerdir=images/base,upperdir=...,workdir=...`) 
+e aciona a chamada ao Kernel montando a partição com a flag mágica de OverlayFS.
+- `init_db`: Inicializa as tabelas da aplicação de forma idempotente, emitindo uma diretiva DDL estrutural em SQL que constrói a tabela relacional 
+de controle apenas se ela estiver ausente no arquivo físico local.

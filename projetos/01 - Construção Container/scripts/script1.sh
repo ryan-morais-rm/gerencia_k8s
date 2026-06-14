@@ -4,13 +4,13 @@
 
 sudo umount containers/teste 2>/dev/null
 
-sudo rm -rf images/base overlays/teste containers/teste
-mkdir -p images/base
+sudo rm -rf ../images/base ../overlays/teste ../containers/teste
+mkdir -p ../images/base ../overlays/ ../containers/
 
 docker run --name alpine-temp alpine true
 docker export alpine-temp > alpine-rootfs.tar
 docker rm alpine-temp
 
-sudo tar -xf alpine-rootfs.tar -C images/base/
+sudo tar -xf alpine-rootfs.tar -C ../images/base/
 
 rm alpine-rootfs.tar
