@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount, MsFlags};
 use rusqlite::{Connection, Result as SqlResult};
 
 pub fn baixar_ou_atualizar_imagem(repo_url: &str, caminho_destino: &str) {
@@ -16,7 +16,7 @@ pub fn baixar_ou_atualizar_imagem(repo_url: &str, caminho_destino: &str) {
         let status = Command::new("git").arg("-C").arg(caminho_destino).arg("pull").status().unwrap();
         if status.success() { println!("Imagem base atualizada com sucesso!"); }
     } else {
-        println!("🛰️ Clonando rootfs a partir de: {}", repo_url);
+        println!("Clonando rootfs a partir de: {}", repo_url);
         let status = Command::new("git").arg("clone").arg(repo_url).arg(caminho_destino).status().unwrap();
         if status.success() { println!("Imagem base baixada com sucesso!"); }
     }
@@ -97,4 +97,39 @@ pub fn configurar_cgroup(name: &str, pid: u32, memory_mb: Option<u32>) {
 
     let procs_path = format!("{}/cgroup.procs", cgroup_path);
     fs::write(&procs_path, pid.to_string()).expect("Falha ao registrar processo no cgroup");
+}
+
+pub fn montar_volume(volume_arg: &str, merged_path: &str) {
+    let partes: Vec<&str> = volume_arg.split(':').collect();
+    if partes.len() != 2 {
+        eprintln!("Erro: O volume deve estar no formato host_path:container_path");
+        return;
+    }
+
+    let host_path = partes[0];
+    let container_path = partes[1].trim_start_matches('/'); 
+    let target_path = format!("{}/{}", merged_path, container_path);
+
+    if !Path::new(host_path).exists() {
+        eprintln!("Erro: Caminho de volume no host não existe: {}", host_path);
+        return;
+    }
+
+    if !Path::new(&target_path).exists() {
+        fs::create_dir_all(&target_path).expect("Falha ao criar diretório de montagem no container");
+    }
+
+    mount(
+        Some(host_path),
+        target_path.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ).expect("Falha ao montar volume bind");
+
+    println!("Volume montado: {} -> {}", host_path, target_path);
+}
+
+pub fn desmontar_volume(path: &str) {
+    let _ = umount(path);
 }

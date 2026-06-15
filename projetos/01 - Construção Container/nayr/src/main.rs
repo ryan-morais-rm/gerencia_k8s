@@ -7,7 +7,8 @@ use nix::sched::{unshare, CloneFlags};
 use clap::{Parser, Subcommand};
 
 mod utils;
-use crate::utils::{baixar_ou_atualizar_imagem, preparar_pastas_overlay, montar_overlay_interno, init_db, configurar_cgroup};
+use crate::utils::{baixar_ou_atualizar_imagem, preparar_pastas_overlay, montar_overlay_interno, init_db, 
+    configurar_cgroup, montar_volume, desmontar_volume};
 
 #[derive(Parser)]
 #[command(name = "nayr")]
@@ -30,6 +31,10 @@ enum Commands {
         exec: String,
         #[arg(short, long)]
         memory: Option<u32>,
+        #[arg(short, long)]
+        volume: Option<String>,
+        #[arg(short, long)]
+        interactive: bool,
     },
     Ps,
     #[command(hide = true)]
@@ -38,6 +43,8 @@ enum Commands {
         name: String,
         #[arg(short, long)]
         exec: String,
+        #[arg(short, long)]
+        volume: Option<String>,
     },
     Rm {
         #[arg(short, long)]
@@ -46,6 +53,8 @@ enum Commands {
     Start {
         #[arg(short, long)]
         name: String,
+        #[arg(short, long)]
+        volume: Option<String>,
     },
     Stop {
         #[arg(short, long)]
@@ -70,8 +79,8 @@ fn main() {
             let destino = "images/base";
             println!("Iniciando gerenciamento da imagem base...");
             baixar_ou_atualizar_imagem(repo, destino);
-        }
-        Commands::Run { name, exec, memory } => {
+        },
+        Commands::Run { name, exec, memory, volume, interactive } => {
             println!("Criando infraestrutura e Namespaces para '{}'...", name);
 
             preparar_pastas_overlay(name);
@@ -92,20 +101,33 @@ fn main() {
             unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .expect("Falha ao criar novos namespaces (unshare)");
 
-            let mut child_proc = Command::new("/proc/self/exe")
-                .arg("child")
-                .arg("--name")
-                .arg(name)
-                .arg("--exec")
-                .arg(exec)
-                .stdout(Stdio::from(log_file))
-                .stderr(Stdio::from(log_file_err))
+            let mut cmd = Command::new("/proc/self/exe");
+            cmd.arg("child").arg("--name").arg(name).arg("--exec").arg(exec);
+
+            if let Some(vol) = volume {
+                cmd.arg("--volume").arg(vol);
+            }
+
+            let (stdout, stderr) = if *interactive {
+                (Stdio::inherit(), Stdio::inherit()) 
+            } else {
+                (Stdio::from(log_file), Stdio::from(log_file_err))
+            };
+
+            let mut spawned_proc = cmd
+                .stdout(stdout)
+                .stderr(stderr)
+                .stdin(if *interactive { Stdio::inherit() } else { Stdio::null() }) 
                 .spawn()
                 .expect("Falha ao reexecutar o binário em modo child");
 
-            let child_pid = child_proc.id();
+            let child_pid = spawned_proc.id();
 
-            println!("Processo em execução! Utilize 'nayr logs --name {}' para visualizar as saídas.", name);
+            if *interactive {
+                println!("Processo interativo iniciado! (Pressione Ctrl+C para sair ou digite 'exit')");
+            } else {
+                println!("Processo em execução! Utilize 'nayr logs --name {}' para visualizar as saídas.", name);
+            }
             
             configurar_cgroup(name, child_pid, *memory);
 
@@ -115,7 +137,8 @@ fn main() {
                     (name, child_pid, "Running", exec),
                 ).ok();
             }
-            match child_proc.wait() {
+            
+            match spawned_proc.wait() {
                 Ok(status) => {
                     println!("\nContentor '{}' finalizado com status: {}", name, status);
                     if let Ok(conn) = init_db() {
@@ -125,7 +148,7 @@ fn main() {
                 Err(e) => eprintln!("Erro ao aguardar o contentor: {}", e),
             }
         },
-        Commands::Start { name } => {
+        Commands::Start { name, volume } => {
             println!("A preparar para iniciar o contentor '{}'...", name);
             let mut stored_cmd = String::new();
 
@@ -166,18 +189,22 @@ fn main() {
             unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .expect("Falha ao criar novos namespaces (unshare)");
 
-            let mut child_proc = Command::new("/proc/self/exe")
-                .arg("child")
-                .arg("--name")
-                .arg(name)
-                .arg("--exec")
-                .arg(&stored_cmd)
+            let mut child_proc = Command::new("/proc/self/exe");
+            child_proc.arg("child")
+                .arg("--name").arg(name)
+                .arg("--exec").arg(&stored_cmd);
+
+            if let Some(vol) = volume {
+                child_proc.arg("--volume").arg(vol);
+            }
+
+            let mut spawned_proc = child_proc
                 .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(log_file_err))
                 .spawn()
                 .expect("Falha ao reexecutar o binário em modo child");
 
-            let child_pid = child_proc.id();
+            let child_pid = spawned_proc.id();
 
             println!("Processo retomado! Utilize 'nayr logs --name {}' para visualizar as saídas.", name);
 
@@ -190,7 +217,7 @@ fn main() {
                 ).ok();
             }
             
-            match child_proc.wait() {
+            match spawned_proc.wait() {
                 Ok(status) => {
                     println!("\nContentor '{}' finalizado com status: {}", name, status);
                     if let Ok(conn) = init_db() {
@@ -248,7 +275,7 @@ fn main() {
                 println!("Nenhum ficheiro de log encontrado para o contentor '{}'.", name);
             }
         }
-        Commands::Child { name, exec } => {
+        Commands::Child { name, exec, volume } => {
             nix::mount::mount(
                 None::<&str>,
                 "/",
@@ -258,6 +285,10 @@ fn main() {
             ).expect("Falha ao privar a montagem");
 
             let merged_path = montar_overlay_interno(name);
+
+            if let Some(vol) = volume {
+                montar_volume(&vol, &merged_path);
+            }
 
             nix::unistd::sethostname(name).expect("Falha ao definir hostname");
 
@@ -314,8 +345,6 @@ fn main() {
         Commands::Rm { name } => {
             println!("A iniciar a limpeza do contentor '{}'...", name);
             
-            let upper_dir = format!("overlays/{}/upper", name);
-            let work_dir = format!("overlays/{}/work", name);
             let overlay_parent = format!("overlays/{}", name);
             let log_parent = format!("logs/{}", name);
             let merged_dir = format!("containers/{}", name);
@@ -329,7 +358,7 @@ fn main() {
             }
             
             if Path::new(&log_parent).exists() {
-                if let Err(e) = fs::remove_dir_all(&overlay_parent) {
+                if let Err(e) = fs::remove_dir_all(&log_parent) {
                     eprintln!("Aviso: Falha ao remover pastas do log: {}", e);
                 } else {
                     println!("- Camadas de log removidas.");
@@ -337,6 +366,7 @@ fn main() {
             }
 
             if Path::new(&merged_dir).exists() {
+                desmontar_volume(&merged_dir);
                 if let Err(e) = fs::remove_dir_all(&merged_dir) {
                     eprintln!("Aviso: Falha ao remover a pasta raiz do contentor: {}", e);
                 } else {
