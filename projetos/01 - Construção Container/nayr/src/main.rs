@@ -1,10 +1,12 @@
-mod lib;
+mod utils;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use clap::{Parser, Subcommand};
+use nix::unistd::Pid; 
+use nix::sys::signal::{kill, Signal};
 use nix::sched::{unshare, CloneFlags};
-use crate::lib::{baixar_ou_atualizar_imagem, preparar_pastas_overlay, montar_overlay_interno, init_db, configurar_cgroup};
+use crate::utils::{baixar_ou_atualizar_imagem, preparar_pastas_overlay, montar_overlay_interno, init_db, configurar_cgroup};
 
 #[derive(Parser)]
 #[command(name = "nayr")]
@@ -37,6 +39,14 @@ enum Commands {
         exec: String,
     },
     Rm {
+        #[arg(short, long)]
+        name: String,
+    },
+    Start {
+        #[arg(short, long)]
+        name: String,
+    },
+    Stop {
         #[arg(short, long)]
         name: String,
     },
@@ -92,7 +102,102 @@ fn main() {
                 }
                 Err(e) => eprintln!("Erro ao aguardar o contentor: {}", e),
             }
-        }
+        },
+        Commands::Start { name } => {
+            println!("A preparar para iniciar o contentor '{}'...", name);
+            let mut stored_cmd = String::new();
+
+            if let Ok(conn) = init_db() {
+                let mut stmt = conn.prepare("SELECT status, command FROM containers WHERE name = ?1").unwrap();
+                let mut rows = stmt.query([name]).unwrap();
+
+                if let Ok(Some(row)) = rows.next() {
+                    let status: String = row.get(0).unwrap();
+                    stored_cmd = row.get(1).unwrap();
+
+                    if status == "Running" {
+                        println!("O contentor '{}' já se encontra em execução.", name);
+                        return;
+                    }
+                } else {
+                    println!("Erro: Contentor '{}' não encontrado na base de dados.", name);
+                    return;
+                }
+            } else {
+                eprintln!("Erro ao aceder ao banco de dados.");
+                return;
+            }
+
+            println!("A retomar a infraestrutura e Namespaces...");
+            
+            preparar_pastas_overlay(name);
+
+            unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
+                .expect("Falha ao criar novos namespaces (unshare)");
+
+            let mut child_proc = Command::new("/proc/self/exe")
+                .arg("child")
+                .arg("--name")
+                .arg(name)
+                .arg("--exec")
+                .arg(&stored_cmd)
+                .spawn()
+                .expect("Falha ao reexecutar o binário em modo child");
+
+            let child_pid = child_proc.id();
+
+            configurar_cgroup(name, child_pid, None);
+
+            if let Ok(conn) = init_db() {
+                conn.execute(
+                    "UPDATE containers SET pid = ?1, status = 'Running' WHERE name = ?2",
+                    (child_pid, name),
+                ).ok();
+            }
+            
+            match child_proc.wait() {
+                Ok(status) => {
+                    println!("\nContentor '{}' finalizado com status: {}", name, status);
+                    if let Ok(conn) = init_db() {
+                        conn.execute("UPDATE containers SET status = 'Exited' WHERE name = ?1", [name]).ok();
+                    }
+                }
+                Err(e) => eprintln!("Erro ao aguardar o contentor: {}", e),
+            }
+        },
+        Commands::Stop { name } => {
+            println!("A tentar parar o contentor '{}'...", name);
+            if let Ok(conn) = init_db() {
+                let mut stmt = conn.prepare("SELECT pid, status FROM containers WHERE name = ?1").unwrap();
+                let mut rows = stmt.query([name]).unwrap();
+
+                if let Ok(Some(row)) = rows.next() {
+                    let pid: u32 = row.get(0).unwrap();
+                    let status: String = row.get(1).unwrap();
+
+                    if status == "Running" {
+                        let nix_pid = Pid::from_raw(pid as i32);
+                        
+                        match kill(nix_pid, Signal::SIGTERM) {
+                            Ok(_) => {
+                                println!("Sinal SIGTERM enviado ao processo (PID: {}).", pid);
+                                conn.execute("UPDATE containers SET status = 'Exited' WHERE name = ?1", [name]).unwrap();
+                            }
+                            Err(e) => {
+                                eprintln!("Aviso: Não foi possível parar o processo {}. Ele já pode ter sido encerrado. (Erro: {})", pid, e);
+                                conn.execute("UPDATE containers SET status = 'Exited' WHERE name = ?1", [name]).unwrap();
+                            }
+                        }
+                    } else {
+                        println!("O contentor '{}' já se encontra parado (Status: {}).", name, status);
+                    }
+                } else {
+                    println!("Erro: Contentor '{}' não encontrado no banco de dados.", name);
+                }
+            } else {
+                eprintln!("Erro ao aceder ao banco de dados.");
+            }
+        },
         Commands::Child { name, exec } => {
             nix::mount::mount(
                 None::<&str>,
