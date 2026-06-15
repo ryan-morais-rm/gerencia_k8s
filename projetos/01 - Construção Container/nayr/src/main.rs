@@ -1,11 +1,12 @@
-mod utils;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
-use std::process::Command;
-use clap::{Parser, Subcommand};
+use std::process::{Command, Stdio};
 use nix::unistd::Pid; 
 use nix::sys::signal::{kill, Signal};
 use nix::sched::{unshare, CloneFlags};
+use clap::{Parser, Subcommand};
+
+mod utils;
 use crate::utils::{baixar_ou_atualizar_imagem, preparar_pastas_overlay, montar_overlay_interno, init_db, configurar_cgroup};
 
 #[derive(Parser)]
@@ -50,6 +51,10 @@ enum Commands {
         #[arg(short, long)]
         name: String,
     },
+    Logs {
+        #[arg(short, long)]
+        name: String,
+    },
 }
 
 fn main() {
@@ -71,6 +76,19 @@ fn main() {
 
             preparar_pastas_overlay(name);
 
+            let log_path = format!("logs/{}/container.log", name);
+            let log_dir = Path::new(&log_path).parent().unwrap();
+            fs::create_dir_all(log_dir).expect("Falha ao criar diretório de logs"); 
+
+            let log_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(&log_path)
+                .expect("Falha ao abrir o ficheiro de log");
+
+            let log_file_err = log_file.try_clone().expect("Falha ao clonar descritor do log");
+
             unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .expect("Falha ao criar novos namespaces (unshare)");
 
@@ -80,10 +98,14 @@ fn main() {
                 .arg(name)
                 .arg("--exec")
                 .arg(exec)
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_err))
                 .spawn()
                 .expect("Falha ao reexecutar o binário em modo child");
 
             let child_pid = child_proc.id();
+
+            println!("Processo em execução! Utilize 'nayr logs --name {}' para visualizar as saídas.", name);
             
             configurar_cgroup(name, child_pid, *memory);
 
@@ -132,6 +154,15 @@ fn main() {
             
             preparar_pastas_overlay(name);
 
+            let log_path = format!("logs/{}/container.log", name);
+            let log_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(&log_path)
+                .expect("Falha ao abrir/criar o ficheiro de log");
+            let log_file_err = log_file.try_clone().expect("Falha ao clonar descritor do log");
+
             unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)
                 .expect("Falha ao criar novos namespaces (unshare)");
 
@@ -141,10 +172,14 @@ fn main() {
                 .arg(name)
                 .arg("--exec")
                 .arg(&stored_cmd)
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_err))
                 .spawn()
                 .expect("Falha ao reexecutar o binário em modo child");
 
             let child_pid = child_proc.id();
+
+            println!("Processo retomado! Utilize 'nayr logs --name {}' para visualizar as saídas.", name);
 
             configurar_cgroup(name, child_pid, None);
 
@@ -198,6 +233,21 @@ fn main() {
                 eprintln!("Erro ao aceder ao banco de dados.");
             }
         },
+        Commands::Logs { name } => {
+            let log_path = format!("logs/{}/container.log", name);
+            if Path::new(&log_path).exists() {
+                match fs::read_to_string(&log_path) {
+                    Ok(conteudo) => {
+                        println!("=== Logs do Contentor '{}' ===", name);
+                        print!("{}", conteudo);
+                        println!("================================");
+                    }
+                    Err(e) => eprintln!("Erro ao ler o ficheiro de logs: {}", e),
+                }
+            } else {
+                println!("Nenhum ficheiro de log encontrado para o contentor '{}'.", name);
+            }
+        }
         Commands::Child { name, exec } => {
             nix::mount::mount(
                 None::<&str>,
@@ -267,6 +317,7 @@ fn main() {
             let upper_dir = format!("overlays/{}/upper", name);
             let work_dir = format!("overlays/{}/work", name);
             let overlay_parent = format!("overlays/{}", name);
+            let log_parent = format!("logs/{}", name);
             let merged_dir = format!("containers/{}", name);
 
             if Path::new(&overlay_parent).exists() {
@@ -274,6 +325,14 @@ fn main() {
                     eprintln!("Aviso: Falha ao remover pastas do overlay: {}", e);
                 } else {
                     println!("- Camadas de escrita (upper/work) removidas.");
+                }
+            }
+            
+            if Path::new(&log_parent).exists() {
+                if let Err(e) = fs::remove_dir_all(&overlay_parent) {
+                    eprintln!("Aviso: Falha ao remover pastas do log: {}", e);
+                } else {
+                    println!("- Camadas de log removidas.");
                 }
             }
 
