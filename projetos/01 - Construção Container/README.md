@@ -1,12 +1,16 @@
 # Instruções de Uso
+- Faça o build da ferramenta com cargo, acesse a pasta nayr e digite:
+  * `cargo build`
 - Baixar imagem base: 
-  * `sudo -E ./target/debug/nayr pull --repo <URL_DO_GIT_COM_ROOTFS>`
+  * `sudo -E ./nayr/target/debug/nayr pull --repo <URL_DO_GIT_COM_ROOTFS>`
 - Executar um container:
-  * `sudo -E ./target/debug/nayr run --name <NOME> --memory <MB> --exec "<COMANDO>"`
+  * `sudo -E ./nayr/target/debug/nayr run --name <NOME> --memory <MB> --exec "<COMANDO>"`
 - Listar container:
-  * `sudo -E ./target/debug/nayr ps`
+  * `sudo -E ./nayr/target/debug/nayr ps`
+- Parar container:
+  * `sudo -E ./nayr/target/debug/nayr stop --name <NOME>`
 - Remover um container e liberar recurso:
-  * `sudo -E ./target/debug/nayr rm --name <NOME>`
+  * `sudo -E ./nayr/target/debug/nayr rm --name <NOME>`
 
 # Limitações Conhecidas
 - Chroot vs Pivot Root: A aplicação utiliza chroot por motivos de prototipagem. Em um ambiente de produção real, seria mandatório o uso de pivot_root para evitar vulnerabilidades de "jailbreak".

@@ -4,7 +4,7 @@ nayr/target/
 
 # --- Dados Dinâmicos do Container Runtime ---
 # Ignora as imagens base baixadas via git clone/pull
-images/base
+images/base/
 
 # Ignora os pontos de montagem finais dos containers
 containers/*
@@ -16,7 +16,7 @@ overlays/*
 !overlays/.gitkeep
 
 # Ignora os arquivos de logs gerados pelos containers
-logs/*.log
+logs/
 
 # --- Banco de Dados Local ---
 # Ignora o banco de dados do SQLite e arquivos de trava temporários
